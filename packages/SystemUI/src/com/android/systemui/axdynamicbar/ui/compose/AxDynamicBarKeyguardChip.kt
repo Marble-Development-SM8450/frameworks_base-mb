@@ -195,6 +195,11 @@ fun AxDynamicBarKeyguardChip(
     val motionScheme = MaterialTheme.motionScheme
     val expandableController = rememberExpandableController(color = Color.Transparent, shape = ChipShape)
 
+    val batteryChipWouldShow = keyguardBatteryChipMode > 0 &&
+        (keyguardBatteryChipMode != 1 || batteryInfo.isCharging)
+
+    val hasContentToShow = state != null || batteryChipWouldShow
+
     Box(modifier = modifier) {
 
         val expandedVisibleState = remember { MutableTransitionState(false) }
@@ -224,7 +229,8 @@ fun AxDynamicBarKeyguardChip(
         }
 
         AnimatedVisibility(
-            visible = isOnKeyguard && isEnabled && isKeyguardEnabled && !isKeyguardExpanded,
+            visible = isOnKeyguard && isEnabled && isKeyguardEnabled &&
+                !isKeyguardExpanded && hasContentToShow,
             enter = fadeIn(tween(durationMillis = 200, delayMillis = 300)) +
                 scaleIn(
                     initialScale = 0.9f,
@@ -275,12 +281,14 @@ fun AxDynamicBarKeyguardChip(
                     }
 
                 if (displayEvent == null) {
-                    KeyguardBatteryChip(
-                        batteryInfo,
-                        keyguardBatteryChipMode,
-                        batteryString,
-                        modifier,
-                    )
+                    if (batteryChipWouldShow) {
+                        KeyguardBatteryChip(
+                            batteryInfo,
+                            keyguardBatteryChipMode,
+                            batteryString,
+                            modifier,
+                        )
+                    }
                     return@AnimatedVisibility
                 }
 
@@ -343,12 +351,14 @@ fun AxDynamicBarKeyguardChip(
                     }
                 }
             } else {
-                KeyguardBatteryChip(
-                    batteryInfo,
-                    keyguardBatteryChipMode,
-                    batteryString,
-                    modifier,
-                )
+                if (batteryChipWouldShow) {
+                    KeyguardBatteryChip(
+                        batteryInfo,
+                        keyguardBatteryChipMode,
+                        batteryString,
+                        modifier,
+                    )
+                }
             }
         }
     }
