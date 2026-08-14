@@ -41,6 +41,9 @@ import android.hardware.power.Boost;
 import android.graphics.Insets;
 import android.graphics.Rect;
 import android.graphics.Region;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.Process;
 import android.os.PowerManagerInternal;
 import android.provider.Settings;
 import android.util.IndentingPrintWriter;
@@ -408,6 +411,8 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         mStatusBarKeyguardViewManager = statusBarKeyguardViewManager;
         mLightBarController = lightBarController;
         mNotificationStackScrollLayoutController = notificationStackScrollLayoutController;
+        mSuppressLayoutFailsafe = () ->
+                mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
         mLockscreenShadeTransitionController = lockscreenShadeTransitionController;
         mDepthController = notificationShadeDepthController;
         mShadeHeaderController = shadeHeaderController;
@@ -1105,6 +1110,11 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         // end
         DejankUtils.notifyRendererOfExpensiveFrame(mPanelView, "onExpansionStarted");
         boostInteraction(300);
+        mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(true);
+        // Failsafe: guarantee release even if a completion path we haven't wired
+        // (of onExpansionStarted's several call sites) doesn't explicitly clear it.
+        mHandler.removeCallbacks(mSuppressLayoutFailsafe);
+        mHandler.postDelayed(mSuppressLayoutFailsafe, 1000);
 
         // Reset scroll position and apply that position to the expanded height.
         float height = mExpansionHeight;
@@ -1974,6 +1984,8 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
                             event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                 } else {
                     resetEarlyExpansion();
+                    mNotificationStackScrollLayoutController
+                            .setSuppressChildrenMeasureAndLayout(false);
                     traceQsJank(false,
                             event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                 }
@@ -2193,6 +2205,7 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
                 mAnimating = false;
                 mPanelViewControllerLazy.get().notifyExpandingFinished();
                 mNotificationStackScrollLayoutController.resetCheckSnoozeLeavebehind();
+                mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
                 mExpansionAnimator = null;
                 if (onFinishRunnable != null) {
                     onFinishRunnable.run();
@@ -2674,7 +2687,49 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         if (pmi != null) {
             pmi.setPowerBoost(Boost.INTERACTION, durationMs);
         }
+        raiseUiThreadPriority();
+        mHandler.removeCallbacks(mRestoreUiThreadPriority);
+        mHandler.postDelayed(mRestoreUiThreadPriority, durationMs);
     }
+
+    private int mSavedUiThreadPriority = Integer.MIN_VALUE;
+
+    /**
+     * Portable, non-device-specific analog of OEM RT-scheduling boosts: raises this
+     * thread's nice value using the standard public priority class AOSP's own
+     * RenderThread/Choreographer already use, instead of SCHED_FIFO/RR + raw cpuset
+     * writes. Weaker than real-time scheduling, but has no device/kernel-specific
+     * failure mode - worst case it's a no-op.
+     */
+    private void raiseUiThreadPriority() {
+        try {
+            if (mSavedUiThreadPriority == Integer.MIN_VALUE) {
+                mSavedUiThreadPriority = Process.getThreadPriority(Process.myTid());
+            }
+            Process.setThreadPriority(Process.myTid(), Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch (SecurityException | IllegalArgumentException e) {
+            // Device/kernel doesn't allow it - leave scheduling untouched.
+        }
+    }
+
+    private final Runnable mRestoreUiThreadPriority = () -> {
+        if (mSavedUiThreadPriority != Integer.MIN_VALUE) {
+            try {
+                Process.setThreadPriority(Process.myTid(), mSavedUiThreadPriority);
+            } catch (SecurityException | IllegalArgumentException e) {
+                // Ignore - nothing more we can safely do.
+            }
+        }
+    };
+
+    /**
+     * Handler used solely to guarantee release of the notification-layout suppression
+     * started in {@link #onExpansionStarted()}, in case a completion path fails to
+     * explicitly clear it.
+     */
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+
+    private final Runnable mSuppressLayoutFailsafe;
 
     interface ExpansionHeightSetToMaxListener {
         void onExpansionHeightSetToMax(boolean requestPaddingUpdate);
