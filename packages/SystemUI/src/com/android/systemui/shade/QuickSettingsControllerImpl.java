@@ -41,12 +41,17 @@ import android.hardware.power.Boost;
 import android.graphics.Insets;
 import android.graphics.Rect;
 import android.graphics.Region;
+import android.os.Handler;
+import android.os.Looper;
+import android.os.PerformanceHintManager;
+import android.os.Process;
 import android.os.PowerManagerInternal;
 import android.provider.Settings;
 import android.util.IndentingPrintWriter;
 import android.util.Log;
 import android.util.MathUtils;
 import android.view.Display;
+import android.view.Choreographer;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.VelocityTracker;
@@ -408,6 +413,10 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         mStatusBarKeyguardViewManager = statusBarKeyguardViewManager;
         mLightBarController = lightBarController;
         mNotificationStackScrollLayoutController = notificationStackScrollLayoutController;
+        mSuppressLayoutFailsafe = () -> {
+            mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
+            stopHintSession();
+        };
         mLockscreenShadeTransitionController = lockscreenShadeTransitionController;
         mDepthController = notificationShadeDepthController;
         mShadeHeaderController = shadeHeaderController;
@@ -1105,6 +1114,12 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         // end
         DejankUtils.notifyRendererOfExpensiveFrame(mPanelView, "onExpansionStarted");
         boostInteraction(300);
+        mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(true);
+        startHintSession();
+        // Safety net: guaranteed release in case an untraced call path
+        // leaves this flag set.
+        mHandler.removeCallbacks(mSuppressLayoutFailsafe);
+        mHandler.postDelayed(mSuppressLayoutFailsafe, 1000);
 
         // Reset scroll position and apply that position to the expanded height.
         float height = mExpansionHeight;
@@ -1974,6 +1989,9 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
                             event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                 } else {
                     resetEarlyExpansion();
+                    mNotificationStackScrollLayoutController
+                            .setSuppressChildrenMeasureAndLayout(false);
+                    stopHintSession();
                     traceQsJank(false,
                             event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                 }
@@ -2193,6 +2211,8 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
                 mAnimating = false;
                 mPanelViewControllerLazy.get().notifyExpandingFinished();
                 mNotificationStackScrollLayoutController.resetCheckSnoozeLeavebehind();
+                mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
+                stopHintSession();
                 mExpansionAnimator = null;
                 if (onFinishRunnable != null) {
                     onFinishRunnable.run();
@@ -2673,8 +2693,109 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         PowerManagerInternal pmi = LocalServices.getService(PowerManagerInternal.class);
         if (pmi != null) {
             pmi.setPowerBoost(Boost.INTERACTION, durationMs);
+            pmi.setPowerBoost(Boost.DISPLAY_UPDATE_IMMINENT, 0);
+        }
+        raiseUiThreadPriority();
+        mHandler.removeCallbacks(mRestoreUiThreadPriority);
+        mHandler.postDelayed(mRestoreUiThreadPriority, durationMs);
+    }
+
+    private int mSavedUiThreadPriority = Integer.MIN_VALUE;
+
+    /**
+     * Portable, non-device-specific analog of OEM RT-scheduling boosts: raises this
+     * thread's nice value using the standard public priority class AOSP's own
+     * RenderThread/Choreographer already use, instead of SCHED_FIFO/RR + raw cpuset
+     * writes. Weaker than real-time scheduling, but has no device/kernel-specific
+     * failure mode - worst case it's a no-op.
+     */
+    private void raiseUiThreadPriority() {
+        try {
+            if (mSavedUiThreadPriority == Integer.MIN_VALUE) {
+                mSavedUiThreadPriority = Process.getThreadPriority(Process.myTid());
+            }
+            Process.setThreadPriority(Process.myTid(), Process.THREAD_PRIORITY_URGENT_DISPLAY);
+        } catch (SecurityException | IllegalArgumentException e) {
+            // Device/kernel doesn't allow it - leave scheduling untouched.
         }
     }
+
+    private final Runnable mRestoreUiThreadPriority = () -> {
+        if (mSavedUiThreadPriority != Integer.MIN_VALUE) {
+            try {
+                Process.setThreadPriority(Process.myTid(), mSavedUiThreadPriority);
+            } catch (SecurityException | IllegalArgumentException e) {
+                // Ignore - nothing more we can safely do.
+            }
+        }
+    };
+
+    // ---- ADPF PerformanceHintSession: precise frame-pacing hint for QS expansion ----
+    // Public SDK API (android.os.PerformanceHintManager, API 33+), reached via
+    // Context.getSystemService() - a normal cross-process Binder call, unaffected by
+    // the LocalServices/process-locality caveat on the PowerManagerInternal boost above.
+    private static final long QS_TARGET_FRAME_NANOS = 16_666_666L; // ~60fps budget
+    private PerformanceHintManager.Session mHintSession;
+    private boolean mHintSessionAttempted = false;
+    private boolean mHintSessionActive = false;
+    private long mLastHintFrameTimeNanos = 0L;
+
+    private void ensureHintSession() {
+        if (mHintSession != null || mHintSessionAttempted) {
+            return;
+        }
+        mHintSessionAttempted = true;
+        try {
+            PerformanceHintManager phm =
+                    mPanelView.getContext().getSystemService(PerformanceHintManager.class);
+            if (phm != null) {
+                mHintSession = phm.createHintSession(
+                        new int[]{Process.myTid()}, QS_TARGET_FRAME_NANOS);
+            }
+        } catch (Exception e) {
+            // Unsupported on this device/API level - mHintSession stays null,
+            // every call site below already null-checks it.
+        }
+    }
+
+    private void startHintSession() {
+        ensureHintSession();
+        if (mHintSession == null || mHintSessionActive) {
+            return;
+        }
+        mHintSessionActive = true;
+        mLastHintFrameTimeNanos = System.nanoTime();
+        Choreographer.getInstance().postFrameCallback(mHintFrameCallback);
+    }
+
+    private void stopHintSession() {
+        mHintSessionActive = false;
+    }
+
+    private final Choreographer.FrameCallback mHintFrameCallback = frameTimeNanos -> {
+        if (!mHintSessionActive || mHintSession == null) {
+            return;
+        }
+        long actualDuration = frameTimeNanos - mLastHintFrameTimeNanos;
+        mLastHintFrameTimeNanos = frameTimeNanos;
+        try {
+            mHintSession.reportActualWorkDuration(actualDuration);
+        } catch (IllegalStateException e) {
+            // Session invalidated - stop trying for the rest of this gesture.
+            mHintSessionActive = false;
+            return;
+        }
+        Choreographer.getInstance().postFrameCallback(mHintFrameCallback);
+    };
+
+    /**
+     * Handler used solely to guarantee release of the notification-layout suppression
+     * started in {@link #onExpansionStarted()}, in case a completion path fails to
+     * explicitly clear it.
+     */
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+
+    private final Runnable mSuppressLayoutFailsafe;
 
     interface ExpansionHeightSetToMaxListener {
         void onExpansionHeightSetToMax(boolean requestPaddingUpdate);
