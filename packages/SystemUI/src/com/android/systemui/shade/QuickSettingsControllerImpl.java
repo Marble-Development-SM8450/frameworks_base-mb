@@ -411,8 +411,10 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         mStatusBarKeyguardViewManager = statusBarKeyguardViewManager;
         mLightBarController = lightBarController;
         mNotificationStackScrollLayoutController = notificationStackScrollLayoutController;
-        mSuppressLayoutFailsafe = () ->
-                mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
+        mSuppressLayoutFailsafe = () -> {
+            mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
+            stopQsHardwareLayer();
+        };
         mLockscreenShadeTransitionController = lockscreenShadeTransitionController;
         mDepthController = notificationShadeDepthController;
         mShadeHeaderController = shadeHeaderController;
@@ -1111,6 +1113,7 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         DejankUtils.notifyRendererOfExpensiveFrame(mPanelView, "onExpansionStarted");
         boostInteraction(300);
         mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(true);
+        startQsHardwareLayer();
         // Safety net: guaranteed release in case an untraced call path
         // leaves this flag set.
         mHandler.removeCallbacks(mSuppressLayoutFailsafe);
@@ -1986,6 +1989,7 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
                     resetEarlyExpansion();
                     mNotificationStackScrollLayoutController
                             .setSuppressChildrenMeasureAndLayout(false);
+                    stopQsHardwareLayer();
                     traceQsJank(false,
                             event.getActionMasked() == MotionEvent.ACTION_CANCEL);
                 }
@@ -2206,6 +2210,7 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
                 mPanelViewControllerLazy.get().notifyExpandingFinished();
                 mNotificationStackScrollLayoutController.resetCheckSnoozeLeavebehind();
                 mNotificationStackScrollLayoutController.setSuppressChildrenMeasureAndLayout(false);
+                stopQsHardwareLayer();
                 mExpansionAnimator = null;
                 if (onFinishRunnable != null) {
                     onFinishRunnable.run();
@@ -2686,6 +2691,7 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
         PowerManagerInternal pmi = LocalServices.getService(PowerManagerInternal.class);
         if (pmi != null) {
             pmi.setPowerBoost(Boost.INTERACTION, durationMs);
+            pmi.setPowerBoost(Boost.DISPLAY_UPDATE_IMMINENT, 0);
         }
         raiseUiThreadPriority();
         mHandler.removeCallbacks(mRestoreUiThreadPriority);
@@ -2712,6 +2718,18 @@ public class QuickSettingsControllerImpl implements QuickSettingsController, Dum
             }
         }
     };
+
+    private void startQsHardwareLayer() {
+        if (mQsFrame != null) {
+            mQsFrame.setLayerType(View.LAYER_TYPE_HARDWARE, null);
+        }
+    }
+
+    private void stopQsHardwareLayer() {
+        if (mQsFrame != null) {
+            mQsFrame.setLayerType(View.LAYER_TYPE_NONE, null);
+        }
+    }
 
     /**
      * Handler used solely to guarantee release of the notification-layout suppression
